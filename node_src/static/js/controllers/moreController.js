@@ -6,6 +6,17 @@ function maxLengthCheck(object) {
 (function(){
     var moreController = function($scope, $http, $timeout, $routeParams, $window){
 
+        var spin = function(action){
+            if (action=="start"){
+                     $scope.spinner= new Spinner(opts).spin();
+                    var loadingContainer = document.getElementById('loading');
+                    loadingContainer.appendChild($scope.spinner.el);
+                }else if (action=="stop"){
+                     $scope.spinner.stop();
+                     $scope.spinner = false;
+                }
+            }
+
         $scope.folders = {};
         $scope.users = {};
         $scope.incubators = {};
@@ -42,9 +53,15 @@ function maxLengthCheck(object) {
                           },
                           {name:"Node Management",
                            icon:"fa fa-cog",
-                           color:"alert alert-success",
+                           color:"alert alert-info",
                            style:"font-size:36px; padding:10px",
                            opt: "nodeManage",
+                          },
+                          {name:"Node Actions",
+                           icon:"fa fa-terminal",
+                           color:"alert alert-info",
+                           style:"font-size:36px; padding:10px",
+                           opt: "nodeCommands",
                           },
 
                          ];
@@ -65,14 +82,16 @@ function maxLengthCheck(object) {
                     viewLog();
                     break;
                 case "nodeManage":
-                    admin();
+                    getNodeConfiguration();
+                    break;
+                case "nodeCommands":
+                    getNodeConfiguration();
                     break;
                 case "all":
                     break;
             };
         };
         
-        console.log($routeParams.option);
         if ($routeParams.option != 'undefined'){
         $scope.$on('$viewContentLoaded',$scope.exec_option);
         }
@@ -108,7 +127,7 @@ function maxLengthCheck(object) {
                 //console.log($scope.filesObj);
                      })
         };
-        $scope.browse.dowload = function(){
+        $scope.browse.download = function(){
 
             if($scope.selected.files.length == 1){
                 $('#downloadModal').modal('show');
@@ -170,6 +189,13 @@ function maxLengthCheck(object) {
         $scope.nodeManagement.time = new Date();
         $scope.nodeManagement.time = $scope.nodeManagement.time.toString();
         
+        $scope.nodeManagement.exec_cmd = function(cmd_name){
+            $http.post('/node-actions', data = {'action': 'exec_cmd', 'cmd_name' : cmd_name})
+            .success(function(data){
+                $scope.nodeManagement.std_output = data;
+            });
+        };
+        
         $scope.nodeManagement.action = function(action){
                $http.post('/node-actions', data = {'action': action})
                .success(function(res){
@@ -218,7 +244,6 @@ function maxLengthCheck(object) {
 
         $scope.nodeManagement.loadData = function (type) {
             $scope.selected[type] = $scope[type][$scope.selected[type].name];
-            console.log($scope.selected[type]);
         };
 
 
@@ -243,15 +268,20 @@ function maxLengthCheck(object) {
 ///  View Server Logs
         var viewLog = function(){
             ///var log_file_path = $scope.device.log_file;
+                spin('start');
                 $http.get('/node/log')
                      .success(function(data, status, headers, config){
                         $scope.log = data;
                         $scope.showLog = true;
+                        spin('stop');
+                     })
+                      .error(function(){
+                        spin('stop');
                      });
         };
         
-///  Admin
-        var admin = function(){
+///  Admin configurations
+        var getNodeConfiguration = function(){
             ///var log_file_path = $scope.device.log_file;
             $http.get('/node/daemons')
                  .success(function(data, status, headers, config){
@@ -266,8 +296,20 @@ function maxLengthCheck(object) {
 
             $http.get('/node/users')
                  .success(function(data, status, headers, config){
+                     
+                    $scope.groups = [];
                     $scope.users = data;
+
+                    
+                    for (var user in $scope.users) {
+                        
+                       if (($scope.users[user]['group'] !== "") && (!$scope.groups.includes($scope.users[user]['group']))) {
+                            $scope.groups.push ( $scope.users[user]['group'] ); 
+                            }
+                      }
+                    
             });
+            
 
             $http.get('/node/incubators')
                  .success(function(data, status, headers, config){
@@ -278,6 +320,12 @@ function maxLengthCheck(object) {
                  .success(function(data, status, headers, config){
                     $scope.sensors = data;
             });
+        
+            $http.get('/node/commands')
+                 .success(function(data, status, headers, config){
+                    $scope.commands = data;
+            });
+
         
         };
         

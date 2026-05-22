@@ -1,4 +1,3 @@
-from threading import Thread
 import urllib.request, urllib.error, urllib.parse
 import os
 import datetime
@@ -6,12 +5,20 @@ import json
 import time
 import logging
 import traceback
+import pickle
+import mysql.connector
+import socket, struct
+
+from threading import Thread
 from functools import wraps
-import socket
-from zeroconf import ServiceBrowser, Zeroconf
-
+from zeroconf import ServiceBrowser, Zeroconf, IPVersion
 from ethoscope_node.utils.etho_db import ExperimentalDB
+from ethoscope_node.utils.mysql_backup import db_diff
 
+STREAMING_PORT = 8887
+ETHOSCOPE_PORT = 9000
+
+DB_UPDATE_INTERVAL = 30
 
 class ScanException(Exception):
     pass
@@ -39,16 +46,47 @@ def retry(ExceptionToCheck, tries=4, delay=3, backoff=2, logger=None):
     return deco_retry
 
 
-class Device():
-    pass
+class Device(Thread):
+
+    @retry(ScanException, tries=3, delay=1, backoff=1)
+    def _get_json(self, url, timeout=10, post_data=None):
+
+        try:
+            req = urllib.request.Request(url, data=post_data, headers={'Content-Type': 'application/json'})
+            f = urllib.request.urlopen(req, timeout=timeout)
+            message = f.read()
+            
+            if not message:
+                # logging.error("URL error whist scanning url: %s. No message back." % self._id_url)
+                raise ScanException("No message back")
+                
+            try:
+                resp = json.loads(message)
+                return resp
+                
+            except ValueError:
+                # logging.error("Could not parse response from %s as JSON object" % self._id_url)
+                raise ScanException("Could not parse Json object")
+    
+        except urllib.error.HTTPError as e:
+           raise ScanException("Error" + str(e.code))
+            #return e
+        
+        except urllib.error.URLError as e:
+           raise ScanException("Error" + str(e.reason))
+            #return e
+        
+        except Exception as e:
+           raise ScanException("Unexpected error" + str(e))
 
 
-class Sensor(Thread):
+class Sensor(Device):
     """
     """
-    def __init__(self, ip, refresh_period = 5, port = 80, results_dir = ""):
+    def __init__(self, ip, port = 80, refresh_period = 5, results_dir = ""):
         self._ip = ip
         self._port = port
+        
         self._data_url = "http://%s:%i/" % (ip, port)
         self._id_url = "http://%s:%i/id" % (ip, port)
         self._post_url = "http://%s:%i/set" % (ip, port)
@@ -98,43 +136,34 @@ class Sensor(Thread):
         self._info["ip"] = self._ip
         self._id = resp['id']
 
-    def set(self, data):
+    def set(self, post_data, usejson=False):
         """
         Set remote variables 
-        data is a dict
+        data is a dict e.g. {"location" : "Incubator_1A", "sensor_name" : "etho_sensor1A"} 
         set key to value
         Value can be char[20]
         """
-        args = urllib.parse.urlencode(data).encode("utf-8")
-        self._get_json(self._post_url, 3, args)
+        
+        if usejson:
+            
+            #converts the dictionary to proper json
+            args = json.dumps(post_data)
+            out = self._get_json( url = self._post_url, timeout = 10, post_data = args)
 
-    @retry(ScanException, tries=3, delay=1, backoff=1)
-    def _get_json(self, url,timeout=5, post_data=None):
+        else:
 
-        try:
-            req = urllib.request.Request(url, data=post_data, headers={'Content-Type': 'application/json'})
-            f = urllib.request.urlopen(req, timeout=timeout)
-            message = f.read()
-            if not message:
-                # logging.error("URL error whist scanning url: %s. No message back." % self._id_url)
-                raise ScanException("No message back")
-            try:
-                resp = json.loads(message)
-                return resp
-            except ValueError:
-                # logging.error("Could not parse response from %s as JSON object" % self._id_url)
-                raise ScanException("Could not parse Json object")
+            args = urllib.parse.urlencode(post_data).encode("utf-8")
+            # converts the dictionary to something like the following
+            # b'location=Incubator_1A&sensor_name=etho_sensor1A'
+            
+            # use a normal POST routine
+            req = urllib.request.Request( url = self._post_url, data=args )
+            out = urllib.request.urlopen(req, timeout=3)
         
-        except urllib.error.HTTPError as e:
-            raise ScanException("Error" + str(e.code))
-            #return e
+        self._update_info()
         
-        except urllib.error.URLError as e:
-            raise ScanException("Error" + str(e.reason))
-            #return e
+        return out
         
-        except Exception as e:
-            raise ScanException("Unexpected error" + str(e))
 
     def _reset_info(self):
         '''
@@ -168,7 +197,7 @@ class Sensor(Thread):
     def info(self):
         return self._info
 
-class Ethoscope(Thread):
+class Ethoscope(Device):
     _ethoscope_db_credentials = {"user": "ethoscope",
                                 "passwd": "ethoscope",
                                 "db":"ethoscope_db"}
@@ -182,9 +211,12 @@ class Ethoscope(Thread):
             'static' : "static",
             'controls' : "controls",
             'machine_info' : "machine",
-            'update' : "update"
+            'connected_module' : "module",
+            'update' : "update",
+            'dumpdb' : "dumpSQLdb"
             }
     
+    # instruction : ['when it is allowed']
     _allowed_instructions_status = { "stream": ["stopped"],
                                      "start": ["stopped"],
                                      "start_record": ["stopped"],
@@ -192,9 +224,13 @@ class Ethoscope(Thread):
                                      "poweroff": ["stopped"],
                                      "reboot" : ["stopped"],
                                      "restart" : ["stopped"],
-                                     "offline": []}
+                                     "dumpdb" : ["stopped"],
+                                     "offline": [],
+                                     "convertvideos" : ["stopped"],
+                                     "test_module" : ["stopped"]
+                                     }
 
-    def __init__(self, ip, refresh_period = 2, port = 9000, results_dir = "/ethoscope_data/results"):
+    def __init__(self, ip, port = ETHOSCOPE_PORT, refresh_period = 5, results_dir = "/ethoscope_data/results"):
         '''
         Initialises the info gathering and controlling activity of a Device by the node
         The server will interrogate the status of the device with frequency of refresh_period
@@ -204,19 +240,21 @@ class Ethoscope(Thread):
         self._ip = ip
         self._port = port
         self._id_url = "http://%s:%i/%s" % (ip, port, self._remote_pages['id'])
+        self._is_online = True
+        self._skip_scanning = False
+        self._refresh_period = refresh_period
 
         self._info = {"status": "offline"}
         self._id = ""
         self._reset_info()
-
-        self._is_online = True
-        self._skip_scanning = False
-        self._refresh_period = refresh_period
+        self._info['ping'] = 0
         
         self._edb = ExperimentalDB()
+        self._last_db_info = 0
+        self._device_controller_created = time.time()
         
-        self._update_info()
         super(Ethoscope,self).__init__()
+
 
     def run(self):
         '''
@@ -235,7 +273,18 @@ class Ethoscope(Thread):
                     self._reset_info()
                 last_refresh = time.time()
 
-    def send_instruction(self,instruction,post_data):
+    def dumpSQLdb(self):
+        
+        post_url = "http://%s:%i/%s/%s" % (self._ip, self._port, self._remote_pages['dumpdb'], self._id)
+        
+        return self._get_json(post_url, 3)
+        
+
+    def send_instruction(self, instruction, post_data):
+        '''
+        Handles JSON instructions received by the server
+        '''
+        
         post_url = "http://%s:%i/%s/%s/%s" % (self._ip, self._port, self._remote_pages['controls'], self._id, instruction)
         self._check_instructions_status(instruction)
 
@@ -267,12 +316,18 @@ class Ethoscope(Thread):
             raise KeyError("Instruction %s is not allowed" % instruction)
 
         if status not in allowed_inst:
-            raise Exception("You cannot send the instruction '%s' to a device in status %s" %(instruction, status))
+            raise Exception("You cannot send the instruction '%s' to a device in status %s" % (instruction, status))
 
     def ip(self):
         return self._ip
-        
+
     def id(self):
+        '''
+        '''
+        # this may be the first time the id is asked.
+        if not self._id:
+            self._update_id()
+            
         return self._id
         
     def info(self):
@@ -282,11 +337,25 @@ class Ethoscope(Thread):
         '''
         Retrieves private machine info from the ethoscope
         This is used to check if the ethoscope is a new installation
+        URL http://<ip>:<port>/machine/<id>
         '''
-        machine_info_url = "http://%s:%i/%s/%s" % (self._ip, self._port, self._remote_pages['machine_info'], self._id)
-        out = self._get_json(machine_info_url)
-        return out
-        
+        if self._id:
+            machine_info_url = "http://%s:%i/%s/%s" % (self._ip, self._port, self._remote_pages['machine_info'], self._id)
+            out = self._get_json(machine_info_url)
+            return out
+        else:
+            return {}
+
+    def connected_module(self):
+        '''
+        Asks the ethoscope to give us information about connected modules. We do not do this through machine info because the step requires
+        opening a serial connection with a module and we do not want to risk doing this when the module is actually running in an experiment.
+        '''
+        if self._id:
+            url = "http://%s:%i/%s/%s" % (self._ip, self._port, self._remote_pages['connected_module'], self._id)
+            return self._get_json(url, timeout=12)
+        else:
+            return {}
 
     def skip_scanning(self, value):
         self._skip_scanning = value
@@ -303,25 +372,36 @@ class Ethoscope(Thread):
         '''
         The node uses this function to relay the stream of images from the device to the node client
         '''
-        stream_url = "http://%s:%i/%s" % (self._ip, 8008, self._remote_pages['stream'])
-        #stream_url = "http://217.7.233.140:80/cgi-bin/faststream.jpg?stream=full&fps=0"
+        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client_socket.connect((self._ip, STREAMING_PORT))
 
-        req = urllib.request.Request(stream_url)
-        stream = urllib.request.urlopen(req, timeout=5)
-        bytes = b''
+        #client_socket.settimeout(5)
+        client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, True)
+        client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
+        
+        data = b""
+        payload_size = struct.calcsize("Q")
+        
         while True:
-            bytes += stream.read(1024)
-            a = bytes.find(b'\xff\xd8') #frame starting 
-            b = bytes.find(b'\xff\xd9') #frame ending
-            if a != -1 and b != -1:
-                frame = bytes[a:b+2]
-                bytes = bytes[b+2:]
-                yield b'--frame\r\n'
-                yield b'X-Timestamp: %s\r\n' % str(time.time()).encode()
-                yield b'Content-Length: %s\r\n' % str(len(frame)).encode()
-                yield b'Content-Type: image/jpeg\r\n\r\n' 
-                yield frame
-                yield b'\r\n'
+            while len(data) < payload_size:
+                packet = client_socket.recv(4*1024)
+                if not packet: break
+                data+=packet
+            
+            packed_msg_size = data[:payload_size]
+            data = data[payload_size:]
+            msg_size = struct.unpack("Q",packed_msg_size)[0]
+            
+            while len(data) < msg_size:
+                data += client_socket.recv(4*1024)
+            
+            frame_data = data[:msg_size]
+            data  = data[msg_size:]
+            frame = pickle.loads(frame_data)
+            
+            yield (b'--frame\r\nContent-Type:image/jpeg\r\n\r\n' + frame.tobytes() + b'\r\n')
+
+        client_socket.close()        
 
     def user_options(self):
         """
@@ -341,7 +421,6 @@ class Ethoscope(Thread):
     def last_image(self):
         """
         Collects the last drawn image fromt the device
-        TODO: on the device side, this should not rely on an actuale image file but be fished from memory
         """
         # we return none if the device is not in a stoppable status (e.g. running, recording)
         if self._info["status"] not in self._allowed_instructions_status["stop"]:
@@ -365,41 +444,13 @@ class Ethoscope(Thread):
             raise KeyError("Cannot find dbg img path for device %s" % self._id)
 
         img_url = "http://%s:%i/%s/%s" % (self._ip, self._port, self._remote_pages['static'], img_path)
+
         try:
             file_like = urllib.request.urlopen(img_url)
             return file_like
+
         except Exception as e:
             logging.warning(traceback.format_exc())
-
-    @retry(ScanException, tries=3, delay=1, backoff=1)
-    def _get_json(self, url,timeout=5, post_data=None):
-
-        try:
-            req = urllib.request.Request(url, data=post_data, headers={'Content-Type': 'application/json'})            
-            f = urllib.request.urlopen(req, timeout=timeout)
-            message = f.read()
-            if not message:
-                # logging.error("URL error whist scanning url: %s. No message back." % self._id_url)
-                raise ScanException("No message back")
-            try:
-                resp = json.loads(message)
-                return resp
-            except ValueError:
-                # logging.error("Could not parse response from %s as JSON object" % self._id_url)
-                raise ScanException("Could not parse Json object")
-        
-        except urllib.error.HTTPError as e:
-            raise ScanException("Error" + str(e.code))
-            #return e
-        
-        except urllib.error.URLError as e:
-            raise ScanException("Error" + str(e.reason))
-            #return e
-        
-        except Exception as e:
-            raise ScanException("Unexpected error" + str(e))
-
-        
 
     def _update_id(self):
         """
@@ -409,15 +460,17 @@ class Ethoscope(Thread):
 
         old_id = self._id
         resp = self._get_json(self._id_url)
+        if not resp:
+            # Ethoscope is not reachable
+            return 0
         self._id = resp['id']
-        if self._id != old_id:
-            if old_id:
-                logging.warning("Device id changed at %s. %s ===> %s" % (self._ip, old_id, self._id))
+        
+        if self._id != old_id and old_id != "":
+            logging.warning("Device id changed at %s. %s ===> %s" % (self._ip, old_id, self._id))
             self._reset_info()
 
         self._info["ip"] = self._ip
         self._id = resp['id']
-
 
     def _reset_info(self):
         '''
@@ -429,43 +482,69 @@ class Ethoscope(Thread):
     def _update_info(self):
         '''
         '''
+
         previous_status = self._info['status']
+        new_status = ''
+
+        self._info['ping'] += 1
 
         try:
-            self._update_id()
-
-        except ScanException:
-            self._reset_info()
-
-            if 'run_id' in self._info['experimental_info']:
-                run_id = self._info['experimental_info']['run_id']
-                self._edb.flagProblem( run_id = run_id, message = "unreached" ) #ethoscope went offline while running
-
-            return
-
-        try:
+            if not self._id:
+                self._update_id()
+            
             data_url = "http://%s:%i/data/%s" % (self._ip, self._port, self._id)
             new_info = self._get_json(data_url)
 
-            new_status = new_info['status']
+            if 'status' in new_info:
+                new_status = new_info['status']
+                
             self._info.update(new_info)
 
-            resp = self._make_backup_path()
-            self._info.update(resp)
+        except ScanException as e:
+            logging.warning(f"error while scanning: {e}")
+            logging.warning(f"ethoscope not reachable, previous state {previous_status}")
 
-        except ScanException:
+            # first check if the problem is that we don't know what the ID is.
+            # self._update_id()
             new_status = 'unreached'
 
-        #if ethoscope is online and returning data
+            if 'experimental_info' in self._info and 'run_id' in self._info['experimental_info']:
+                run_id = self._info['experimental_info']['run_id']
+                self._edb.flagProblem( run_id = run_id, message = "unreached" ) #ethoscope went offline while running
+                if previous_status == 'running'      and new_status == 'unreached': self._edb.updateEthoscopes(ethoscope_id = self._id, status="unreached")
+            else:
+                if previous_status == 'stopped'      and new_status == 'unreached': self._edb.updateEthoscopes(ethoscope_id = self._id, status="offline")
 
-        if 'name' in self._info['experimental_info']:
+            self._reset_info()
+            return
+
+
+        # Appearing online 
+        if previous_status == "offline" and new_status != "offline" and "ETHOSCOPE_OOO" not in self._info['name'].upper():
+
+            mi = self.machine_info()
+
+            if 'kernel' in mi.keys():
+                machine_info = "%s on pi%s" % (mi['kernel'], mi['pi_version'])
+            else:
+                machine_info = ""
+
+            # #We add the device to the database or update its record but only if it is not a 000 device
+            self._edb.updateEthoscopes(ethoscope_id = self._id, ethoscope_name = self._info['name'], last_ip = self._ip, machineinfo = machine_info)
+        
+
+        # Stores full backup path to _info['backup_path']
+        self._make_backup_path()
+
+        #if ethoscope is online and returning data
+        try:
             user_name = self._info['experimental_info']['name']
             location = self._info['experimental_info']['location']
-        else:
+        except:
             user_name = ""
             location = ""
 
-        if 'run_id' in self._info['experimental_info']:
+        try:
             run_id = self._info['experimental_info']['run_id']
             
             #TODO
@@ -481,58 +560,104 @@ class Ethoscope(Thread):
             #not sure the unreach ones actually ever happen
             if previous_status == 'running'      and new_status == 'unreached': self._edb.updateEthoscopes(ethoscope_id = self._id, status="unreached")
             if previous_status == 'stopped'      and new_status == 'unreached': self._edb.updateEthoscopes(ethoscope_id = self._id, status="offline")
-
-            
+   
             #if previous_status == 'running'      and new_status == 'unreached': self._edb.flagProblem( run_id = run_id, message = "unreached" ) #ethoscope went offline during tracking!
+        except:
+            pass
 
 
-        # update the record on the ethoscope table
-        if new_status != previous_status and previous_status != "offline":
-            self._edb.updateEthoscopes(ethoscope_id = self._id, status=new_status)
+        # Every 60 seconds gather info on the current backup if possible
+        if time.time() - self._last_db_info > DB_UPDATE_INTERVAL:
+            try:
+                dbd = db_diff(self._info["db_name"], self._ip, self._info['backup_path'])
+                self._info['backup_status'] = dbd.compare_databases()
 
-    def _make_backup_path(self,  timeout=30):
+            except:
+                # Something went wrong - trying again later
+                self._info['backup_status'] = "N/A"
+
+            self._last_db_info = time.time()
+
+
+    def _make_backup_path(self, timeout=30):
         '''
+        Creates the full path for the backup file, gathering info from the ethoscope
+        
+        The full backup_path will look something like:
+        /ethoscope_data/results/280fd605ceec45fdacdd365f10865f9b/ETHOSCOPE_280/2022-10-17_18-21-27/2022-10-17_17-21-27_280fd605ceec45fdacdd365f10865f9b.db
         '''
         
-        try:
-            import mysql.connector
-            device_id = self._info["id"]
-            device_name = self._info["name"]
-            self._ethoscope_db_credentials["db"] = self._info["db_name"]
+        if self._info["status"] == 'stopped' and "previous_backup_filename" in self._info and self._info["previous_backup_filename"]:
+            fname, _ = os.path.splitext(self._info["previous_backup_filename"])
+            backup_date, backup_time, etho_id = fname.split("_")
             
-            com = "SELECT value from METADATA WHERE field = 'date_time'"
-
-            mysql_db = mysql.connector.connect(host=self._ip,
-                                               connect_timeout=timeout,
-                                               **self._ethoscope_db_credentials,
-                                               buffered=True)
-            cur = mysql_db.cursor()
-            cur.execute(com)
-            query = [c for c in cur]
-            timestamp = float(query[0][0])
-            mysql_db.close()
-            date_time = datetime.datetime.fromtimestamp(timestamp)
-            formatted_time = date_time.strftime('%Y-%m-%d_%H-%M-%S')
-            file_name = "%s_%s.db" % (formatted_time, device_id)
             output_db_file = os.path.join(self._results_dir,
-                                          device_id,
-                                          device_name,
-                                          formatted_time,
-                                          file_name
-                                          )
+                                          etho_id,
+                                          self._info["name"],
+                                          "%s_%s" % (backup_date, backup_time),
+                                          self._info["previous_backup_filename"])
+        
+        elif self._info["status"] != 'stopped' and "backup_filename" in self._info and self._info["backup_filename"]:
 
-        except Exception as e:
-            #logging.error("Could not generate backup path for device. Probably a MySQL issue")
-            #logging.error(traceback.format_exc())
-            return {"backup_path": "None"}
+            #backup_filename is something like 2022-03-13_01-25-20_2719721d8b3e409da53c77be58c7ca62.db
+            fname, _ = os.path.splitext(self._info["backup_filename"])
+            backup_date, backup_time, etho_id = fname.split("_")
+            
+            output_db_file = os.path.join(self._results_dir,
+                                          etho_id,
+                                          self._info["name"],
+                                          "%s_%s" % (backup_date, backup_time),
+                                          self._info["backup_filename"])
+            
+        else:
+        # The ethoscope did not communicate to us its backup_filename
+        # probably because it runs a software version older than October 2022
+        # we will interrogate the mysql database on the ethoscope and try to 
+        # sort out the name ourselves, like the (bad) old times.
 
-        return {"backup_path": output_db_file}
+            try:
+                logging.warning("No information regarding backup file from the ethoscope") 
+                
+                device_id = self._info["id"]
+                device_name = self._info["name"]
+                self._ethoscope_db_credentials["db"] = self._info["db_name"]
+                
+                com = "SELECT value from METADATA WHERE field = 'date_time'"
+
+                mysql_db = mysql.connector.connect(host=self._ip,
+                                                   connect_timeout=timeout,
+                                                   **self._ethoscope_db_credentials,
+                                                   buffered=True,
+                                                   charset='latin1', #this should match what set in ethoscope.utils.io
+                                                   use_unicode=True)
+                cur = mysql_db.cursor()
+                cur.execute(com)
+                query = [c for c in cur]
+                timestamp = float(query[0][0])
+                mysql_db.close()
+                date_time = datetime.datetime.utcfromtimestamp(timestamp)
+                formatted_time = date_time.strftime('%Y-%m-%d_%H-%M-%S')
+                self._info["backup_filename"] = "%s_%s.db" % (formatted_time, device_id)
+                
+                output_db_file = os.path.join(self._results_dir,
+                                              device_id,
+                                              device_name,
+                                              formatted_time,
+                                              self._info["backup_filename"]
+                                              )
+
+            except Exception as e:
+                logging.error("Could not generate backup path for device. Probably a MySQL issue")
+                #logging.error(traceback.format_exc())
+                output_db_file = "None"
+
+
+        self._info.update( {"backup_path": output_db_file} )
 
     def stop(self):
         self._is_online = False
 
-
-class DeviceScanner(object):
+class DeviceScanner():
     """
     Uses zeroconf (aka Bonjour, aka Avahi etc) to passively listen for ethoscope devices registering themselves on the network.
     From: https://github.com/jstasiak/python-zeroconf
@@ -546,7 +671,7 @@ class DeviceScanner(object):
 
     
     def __init__(self, device_refresh_period = 5, deviceClass=Device):
-        self._zeroconf = Zeroconf()
+        self._zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
         self.devices = []
         self.device_refresh_period = device_refresh_period
         self._Device = deviceClass
@@ -574,7 +699,6 @@ class DeviceScanner(object):
         :param id: The ID of the device
         :return: the device instance
         """
-        
         for device in self.devices:
             if device.id()==id:
                 return device
@@ -583,12 +707,12 @@ class DeviceScanner(object):
         # Not found, so produce an error
         #raise KeyError("No such %s device: %s" % (self._device_type, id) )
         
-    def add(self, ip, name=None, device_id=None):
+    def add (self, ip, port, name=None, device_id=None, zcinfo=None):
         """
-        Manually add a device to the list
+        Adds a device to the list
         """
         
-        device = self._Device(ip, self.device_refresh_period, results_dir = self.results_dir )
+        device = self._Device(ip, port=port, refresh_period = self.device_refresh_period, results_dir = self.results_dir )
         if name: device.zeroconf_name = name
         
         device.start()
@@ -597,7 +721,7 @@ class DeviceScanner(object):
          
         self.devices.append(device)
 
-        logging.info("New %s manually added with name = %s, id = %s at IP = %s" % (self._device_type, name, device.id(), ip))
+        logging.info("New %s added with name = %s, id = %s at IP = %s:%s" % (self._device_type, name, device.id(), ip, port))
 
         
     def add_service(self, zeroconf, type, name):
@@ -609,16 +733,19 @@ class DeviceScanner(object):
         type = '_device._tcp.local.'
         name = 'DEVICE000._device._tcp.local.'
         """
+        #logging.info("Got info about device %s" % name)
 
         
         try:
             info = zeroconf.get_service_info(type, name)
 
             if info:
-                #ip = socket.inet_ntoa(info.address)
+                # this is no longer working with version of zeroconf 0.27+ - see https://github.com/home-assistant/core/pull/36277
+                #ip = socket.inet_ntoa(info.address) 
                 ip = socket.inet_ntoa(info.addresses[0])
-                self.add( ip, name )
-        
+                port = info.port
+                self.add( ip, port, name, zcinfo = info )
+                
         except Exception as error:
             logging.error("Exception trying to add zeroconf service '"+name+"' of type '"+type+"': "+str(error))
             
@@ -635,6 +762,13 @@ class DeviceScanner(object):
                 #self.devices.remove(device)
                 return
 
+    def update_service(self, zconf, typ, name):
+        """
+        Callback when a service is updated.
+        """
+        pass
+
+
 class EthoscopeScanner(DeviceScanner):
     """
     Ethoscope specific Scanner
@@ -645,26 +779,38 @@ class EthoscopeScanner(DeviceScanner):
 
     
     def __init__(self, device_refresh_period = 5, results_dir="/ethoscope_data/results", deviceClass=Ethoscope):
-        self._zeroconf = Zeroconf()
+        self._zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
         self.devices = []
         self.device_refresh_period = device_refresh_period
         self.results_dir = results_dir
         self._Device = deviceClass
-        
         self._edb = ExperimentalDB()
+        
+        self.timestarted = datetime.datetime.now()
 
-    def _get_last_backup_time(self, device):
+    def _get_backup_size(self, device):
+        '''
+        '''
         try:
             backup_path = device.info()["backup_path"]
-            time_since_backup = time.time() - os.path.getmtime(backup_path)
-            return time_since_backup
-        except OSError:
+            if backup_path and os.path.exists(backup_path):
+                return os.path.getsize(backup_path)
+        except:
+            return 0
+
+    def _get_last_backup_time(self, device):
+        '''
+        '''
+        try:
+            backup_path = device.info()["backup_path"]
+            if backup_path and os.path.exists(backup_path):
+                return time.time() - os.path.getmtime(backup_path)
+        except:
             return
-        except KeyError:
-            return
-        except Exception as e:
-            logging.error(traceback.format_exc())
-            return
+            
+    @property
+    def current_devices_id(self):
+        return [device.id() for device in self.devices]
 
     def get_all_devices_info(self):
         '''
@@ -689,30 +835,58 @@ class EthoscopeScanner(DeviceScanner):
             if device.name != "ETHOSCOPE_000":
                 out[device.id()] = device.info()
                 out[device.id()]["time_since_backup"] = self._get_last_backup_time(device)
+                out[device.id()]["backup_size"] = self._get_backup_size(device)
             else:
                 out[device.name] = device.info()
                 
         return out
 
-    def add(self, ip, name):
+    def add (self, ip, port=ETHOSCOPE_PORT, name=None, device_id=None, zcinfo=None):
         """
-        Manually add a device to the list
-        """
+        Add an ethoscope to the list
+        TODO: Can be called manually or by zeroconf - it would be good to recognise which case we are in
         
-        #initialised the device and start it
-        device = self._Device(ip, self.device_refresh_period, results_dir = self.results_dir )
-        if name: device.zeroconf_name = name
-        device.start()
+        name will be something like ETHOSCOPE170-170211ce7a844c23abc5ffe6ede1e154._ethoscope._tcp.local
+        """
 
-        self.devices.append(device)
-        logging.info("New %s manually added with name = %s, id = %s at IP = %s" % (self._device_type, name, device.id(), ip))
+        #tries to extract ID from name
+        if zcinfo:
+            try:
+                name = zcinfo['MACHINE_NAME']
+                eid = zcinfo['MACHINE_ID']
+            except:
+                try:
+                    name, eid = name.split(".")[0].split("-")
+                except:
+                    name, eid = None, None
+        else:
+            name, eid = None, None
+            
+        
+        #check if device already exists
+        if eid not in self.current_devices_id or eid is None:
+        
+            #initialised the device and start it
+            device = self._Device(ip, port=port, refresh_period = self.device_refresh_period, results_dir = self.results_dir )
+            device.zeroconf_name = name
+            device.start()
 
-        if 'kernel' in device.machine_info().keys():
-            machine_info = "%s on pi%s" % (device.machine_info()['kernel'], device.machine_info()['pi_version'])
+            logging.info("New %s found with name = %s  at IP = %s:%s" % (self._device_type, name, ip, port))
 
-        #We add the device to the database or update its record but only if it is not a 000 device
-        if device.info()['name'] != "ETHOSCOPE_OOO":
-            self._edb.updateEthoscopes(ethoscope_id = device.id(), ethoscope_name = device.info()['name'], last_ip = ip, machineinfo = machine_info)
+            #The system above is rather fragile because depends on zeroconf names The solution below adds a second layer
+            if device.id() in self.current_devices_id:
+                logging.info("The ethoscope was actually already known. Deleting it.")
+                del device
+            else:
+                logging.info("Adding ethoscope to the list.")
+                self.devices.append(device)
+                
+        
+        else:
+            logging.info("%s %s back online with IP %s" % (self._device_type, name, ip) )
+
+
+
     
     def retire_device (self, id, active=0):
         """
@@ -722,9 +896,6 @@ class EthoscopeScanner(DeviceScanner):
         new_data = self._edb.getEthoscope(id, asdict=True)[id]
         return {'id' : new_data['ethoscope_id'], 'active' : new_data['active']}
         
-        
-
-
 class SensorScanner(DeviceScanner):
     """
     Sensor specific scanner
@@ -734,7 +905,7 @@ class SensorScanner(DeviceScanner):
     _device_type = "sensor"
     
     def __init__(self, device_refresh_period = 60, deviceClass=Sensor):
-        self._zeroconf = Zeroconf()
+        self._zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
         self.devices = []
         self.device_refresh_period = device_refresh_period
         self._Device = deviceClass

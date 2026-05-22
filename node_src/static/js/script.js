@@ -1,5 +1,5 @@
 (function(){
-    var app = angular.module('flyApp', ['ngRoute', 'daterangepicker', 'angularUtils.directives.dirPagination']);
+    var app = angular.module('flyApp', ['ngRoute', 'daterangepicker', 'angularUtils.directives.dirPagination', 'ui.bootstrap']);
     
     app.filter("toArray", function(){
         return function(obj) {
@@ -24,6 +24,20 @@
         return filtered;
       };
     });
+
+    app.directive('ngEnter', function () {
+        return function (scope, element, attrs) {
+            element.bind("keydown keypress", function (event) {
+                if (event.which === 13) {
+                    scope.$apply(function () {
+                        scope.$eval(attrs.ngEnter);
+                    });
+                    event.preventDefault();
+                }
+            });
+        };
+    });
+
 
     // configure our routes
 
@@ -84,19 +98,31 @@
 //            $scope.time = t.toString();
 //        });
 
+        var spin = function(action){
+            if (action=="start"){
+                     $scope.spinner= new Spinner(opts).spin();
+                    var loadingContainer = document.getElementById('userInputs');
+                    loadingContainer.appendChild($scope.spinner.el);
+                }else if (action=="stop"){
+                     $scope.spinner.stop();
+                     $scope.spinner = false;
+                }
+            }
+
         $http.get('/devices').success(function(data){
             $scope.devices = data;
         });
 
-        $http.get('/sensors').success(function(data){
-            $scope.sensors = data;
-            $scope.has_sensors = Object.keys($scope.sensors).length;
-        });
-        
-
-        $http.get("http://lab.gilest.ro:8001/news").success(function(data){
+        $http.get("https://lab.gilest.ro:8001/news").success(function(data){
             $scope.notifications = data.news;
         });
+
+       var get_sensors = function() {
+            $http.get('/sensors').success(function(data){
+                $scope.sensors = data;
+                $scope.has_sensors = Object.keys($scope.sensors).length;
+            })
+        };
 
        var update_local_times = function(){
             $http.get('/node/time').success(function(data){
@@ -107,7 +133,7 @@
             $scope.localtime = t.toString();
         };
 
-       $scope.get_devices = function(){
+       var get_devices = function(){
             $http.get('/devices').success(function(data){
 
                 data_list = [];
@@ -133,11 +159,13 @@
                 $scope.status_n_summary = status_summary
             })
         };
+        
        $scope.secToDate = function(secs){
             d = new Date (isNaN(secs) ? secs : secs * 1000 );
 
             return d.toString();
         };
+        
        $scope.elapsedtime = function(t){
             // Calculate the number of days left
             var days=Math.floor(t / 86400);
@@ -160,6 +188,39 @@
             return x;
 
         };
+        
+                /**
+         * Format bytes as human-readable text.
+         * 
+         * @param bytes Number of bytes.
+         * @param si True to use metric (SI) units, aka powers of 1000. False to use 
+         *           binary (IEC), aka powers of 1024.
+         * @param dp Number of decimal places to display.
+         * 
+         * @return Formatted string.
+         */
+        $scope.humanFileSize = function(bytes, si=false, dp=1) {
+          const thresh = si ? 1000 : 1024;
+
+          if (Math.abs(bytes) < thresh) {
+            return bytes + ' B';
+          }
+
+          const units = si 
+            ? ['kB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'] 
+            : ['KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB'];
+          let u = -1;
+          const r = 10**dp;
+
+          do {
+            bytes /= thresh;
+            ++u;
+          } while (Math.round(Math.abs(bytes) * r) / r >= thresh && u < units.length - 1);
+
+
+          return bytes.toFixed(dp) + ' ' + units[u];
+        };
+
         
        $scope.groupActions.checkStart = function(selected_devices){
             softwareVersion = ""; 
@@ -198,11 +259,39 @@
 
        $scope.$on('$viewContentLoaded',$scope.get_devices);
 
+       $('#editSensorModal').on('show.bs.modal', function(e) {
+           $scope.sensoredit = $(e.relatedTarget).data('sensor');
+       });
+
+       $scope.editSensor = function () {
+           console.log($scope.sensoredit);
+           $http.post('/sensor/set', data=$scope.sensoredit)
+                .success(function(res){
+                    refresh_platform();
+                })
+       };
+
+       $scope.manuallyAdd = function() {
+           
+           spin('start');
+           $http.post('/device/add', data=$scope.ip_to_add)
+                .success(function(res){
+                    spin('stop');
+                    if (res.problems && res.problems.length)  { 
+                        $scope.alertMessage =  "The following entries could not be added: " + res.problems.join();
+                        $('#IPAlertModal').modal('show');
+                        }
+                })
+                .error(function(){
+                    spin('stop');
+                })
+       };
 
        var refresh_platform = function(){
             if (document.visibilityState=="visible"){
-                    $scope.get_devices();
+                    get_devices();
                     update_local_times();
+                    get_sensors();
                     //console.log("refresh platform", new Date());
                     
                     // For some reason that I don't understand, angularjs templates cannot access scope from the header so 
@@ -226,3 +315,4 @@
     });
 }
 )()
+ 
