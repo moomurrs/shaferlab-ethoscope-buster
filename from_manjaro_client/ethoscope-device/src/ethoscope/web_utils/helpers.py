@@ -202,7 +202,7 @@ def hasPiCamera():
     if isMachinePI():
        with os.popen('/opt/vc/bin/vcgencmd get_camera') as cmd:
            out_cmd = cmd.read().strip()
-       out = dict(x.split('=') for x in out_cmd.split(' '))
+       out = dict(x.split('=', 1) for x in out_cmd.split() if '=' in x)
        
        return out["detected"] == out["supported"] == "1"
 
